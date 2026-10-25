@@ -1,0 +1,2607 @@
+--[[
+    NEON LOCK | ULTIMATE UI EDITION  +  PLAYER LIST & ESP
+    LocalScript: StarterPlayer > StarterPlayerScripts
+
+    NOTHING IS BOUND WHEN IT FIRST OPENS.
+    Click a bind button, press a key to bind it, or click the small "X"
+    next to it to unbind it again.
+
+    Bindable actions:
+      Lock              Toggle target camera lock
+      Random            Randomize selected target body part
+      Speed             Toggle CFrame speed
+      Flight            Toggle flight
+      GUI key           Show / hide GUI
+
+    Fixed flight controls (once flight is on):
+      WASD              Flight movement relative to camera
+      Space             Fly upward
+      LeftControl       Fly downward
+
+    NEW - Player list (side panel):
+      - Click a player to SELECT them as your target (click again to
+        deselect). Selecting does NOT lock the camera.
+      - LOCK ONTO TARGET toggles the camera lock on the selected player.
+      - Your Lock key locks the player nearest your cursor (falling back
+        to the selected player if nobody is near it). Locking this way
+        does NOT select anyone in the list - lock and selection are
+        independent, so you can lock somebody else at any time.
+      - Open / close the list with the LIST button in the header or the
+        x on the panel.
+      - Search box: filter the list by display name or @username.
+      - DESELECT TARGET clears the selection (clicking the selected
+        player again does the same).
+      - The list updates live as players join / leave.
+
+    NEW - ESP (side panel):
+      TARGET ESP        ESP on the selected player (no lock needed)
+      ESP ALL           ESP on every other player
+      BOX               2D box + health bar
+      GLOW              Highlight outline / fill (visible through walls)
+      TRACER            Line from the bottom-centre of your screen to the
+                        player's TORSO (always the torso, whatever body
+                        part you are aiming at)
+      NAME              Name above the box, distance + HP below it
+      ESP COLOR         Cycle THEME / RED / WHITE / CYAN / YELLOW / ORANGE / PINK
+
+    Use in your own Roblox Studio experience. Client-side CFrame movement
+    may be overridden by server/network ownership rules in some experiences.
+]]
+
+---------------------------------------------------------------------
+-- SERVICES / CLEAN START
+---------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+RunService:UnbindFromRenderStep("NeonLockCamera")
+RunService:UnbindFromRenderStep("NeonLockFlight")
+RunService:UnbindFromRenderStep("NeonLockESP")
+
+local oldGui = playerGui:FindFirstChild("NeonLock")
+if oldGui then
+    oldGui:Destroy()
+end
+
+local oldEspGui = playerGui:FindFirstChild("NeonLockESP")
+if oldEspGui then
+    oldEspGui:Destroy()
+end
+
+---------------------------------------------------------------------
+-- CONFIGURATION / STATE
+---------------------------------------------------------------------
+
+local THEMES = {
+    Purple = {
+        accent = Color3.fromRGB(190, 91, 255),
+        soft = Color3.fromRGB(105, 43, 158),
+        deep = Color3.fromRGB(47, 24, 70),
+    },
+    Green = {
+        accent = Color3.fromRGB(61, 222, 137),
+        soft = Color3.fromRGB(24, 116, 76),
+        deep = Color3.fromRGB(20, 58, 46),
+    },
+}
+
+local COLORS = {
+    background = Color3.fromRGB(13, 10, 22),
+    panel = Color3.fromRGB(24, 19, 37),
+    panelRaised = Color3.fromRGB(33, 26, 49),
+    button = Color3.fromRGB(39, 31, 57),
+    buttonHover = Color3.fromRGB(55, 42, 77),
+    text = Color3.fromRGB(246, 239, 255),
+    muted = Color3.fromRGB(165, 151, 187),
+    good = Color3.fromRGB(105, 245, 164),
+    warning = Color3.fromRGB(255, 205, 112),
+    bad = Color3.fromRGB(255, 119, 136),
+}
+
+-- ESP colour choices. "THEME" (color = nil) follows the current GUI theme.
+local ESP_COLORS = {
+    {name = "THEME", color = nil},
+    {name = "RED", color = Color3.fromRGB(255, 70, 90)},
+    {name = "WHITE", color = Color3.fromRGB(255, 255, 255)},
+    {name = "CYAN", color = Color3.fromRGB(70, 225, 255)},
+    {name = "YELLOW", color = Color3.fromRGB(255, 225, 90)},
+    {name = "ORANGE", color = Color3.fromRGB(255, 150, 60)},
+    {name = "PINK", color = Color3.fromRGB(255, 105, 200)},
+}
+
+local themeName = "Purple"
+local accent = THEMES[themeName].accent
+local accentSoft = THEMES[themeName].soft
+
+-- Every key starts unbound (nil). You bind them yourself from the GUI.
+local lockKey = nil
+local randomKey = nil
+local speedKey = nil
+local flightKey = nil
+local guiKey = nil
+local guiKeyEnabled = true
+
+local listening = nil
+local listeningButton = nil
+local locked = false
+local lockedPart = nil
+local lockedCharacter = nil
+local lockedPlayer = nil
+local selectedPlayer = nil
+local smoothness = 5
+local prediction = 0
+local partIndex = 2
+local activeSlider = nil
+local walkSpeed = 100
+local speedEnabled = false
+local flightEnabled = false
+local flightSpeed = 60
+
+-- ESP state
+local espTargetEnabled = false
+local espAllEnabled = false
+local espBoxEnabled = true
+local espGlowEnabled = true
+local espTracerEnabled = true
+local espNameEnabled = true
+local espColorIndex = 1
+local espObjects = {}
+
+-- Player list state
+local playerRows = {}
+local refreshPlayerRows -- assigned once the side panel exists
+
+local connections = {}
+local animations = {}
+local buttonMeta = {}
+local sliders = {}
+
+local function remember(connection)
+    table.insert(connections, connection)
+    return connection
+end
+
+local function keyText(key)
+    if key then
+        return string.upper(key.Name)
+    end
+    return "NONE"
+end
+
+local function tween(object, duration, properties, style, direction)
+    if not object or not object.Parent then
+        return nil
+    end
+
+    local info = TweenInfo.new(
+        duration,
+        style or Enum.EasingStyle.Quint,
+        direction or Enum.EasingDirection.Out
+    )
+
+    local animation = TweenService:Create(object, info, properties)
+    table.insert(animations, animation)
+
+    -- Remove completed/cancelled tweens so slider drags and repeated hovers
+    -- don't leave an ever-growing animation list behind.
+    local completedConnection
+    completedConnection = animation.Completed:Connect(function()
+        if completedConnection then
+            completedConnection:Disconnect()
+        end
+        for index = #animations, 1, -1 do
+            if animations[index] == animation then
+                table.remove(animations, index)
+                break
+            end
+        end
+    end)
+
+    animation:Play()
+    return animation
+end
+
+local function addLoopingTween(object, duration, properties)
+    local info = TweenInfo.new(
+        duration,
+        Enum.EasingStyle.Sine,
+        Enum.EasingDirection.InOut,
+        -1,
+        true
+    )
+    local animation = TweenService:Create(object, info, properties)
+    table.insert(animations, animation)
+    animation:Play()
+    return animation
+end
+
+---------------------------------------------------------------------
+-- BODY PART OPTIONS
+---------------------------------------------------------------------
+
+local parts = {
+    {name = "Head", r15 = "Head", r6 = "Head"},
+    {name = "Upper Torso", r15 = "UpperTorso", r6 = "Torso"},
+    {name = "Lower Torso", r15 = "LowerTorso", r6 = "Torso"},
+    {name = "Root Part", r15 = "HumanoidRootPart", r6 = "HumanoidRootPart"},
+    {name = "Left Arm", r15 = "LeftUpperArm", r6 = "Left Arm"},
+    {name = "Right Arm", r15 = "RightUpperArm", r6 = "Right Arm"},
+    {name = "Left Leg", r15 = "LeftUpperLeg", r6 = "Left Leg"},
+    {name = "Right Leg", r15 = "RightUpperLeg", r6 = "Right Leg"},
+}
+
+---------------------------------------------------------------------
+-- GUI ROOT / WINDOW
+---------------------------------------------------------------------
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "NeonLock"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 30
+gui.Parent = playerGui
+
+local shadow = Instance.new("Frame")
+shadow.Name = "WindowGlow"
+shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+shadow.Size = UDim2.fromOffset(402, 612)
+shadow.Position = UDim2.new(0.5, 6, 0.5, 7)
+shadow.BackgroundColor3 = accent
+shadow.BackgroundTransparency = 0.91
+shadow.BorderSizePixel = 0
+shadow.ZIndex = 0
+shadow.Parent = gui
+
+local function round(object, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius)
+    corner.Parent = object
+    return corner
+end
+
+local function stroke(object, color, thickness, transparency)
+    local result = Instance.new("UIStroke")
+    result.Color = color or accent
+    result.Thickness = thickness or 1
+    result.Transparency = transparency or 0
+    result.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    result.Parent = object
+    return result
+end
+
+local function gradient(object, colors, rotation)
+    local result = Instance.new("UIGradient")
+    result.Color = colors
+    result.Rotation = rotation or 0
+    result.Parent = object
+    return result
+end
+
+local frame = Instance.new("Frame")
+frame.Name = "MainWindow"
+frame.AnchorPoint = Vector2.new(0.5, 0.5)
+frame.Size = UDim2.fromOffset(390, 600)
+frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+frame.BackgroundColor3 = COLORS.background
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.ClipsDescendants = false
+frame.ZIndex = 1
+frame.Parent = gui
+round(frame, 16)
+
+-- Separate scales let the window fit smaller viewports while still allowing
+-- the opening animation to run independently.
+local responsiveScale = Instance.new("UIScale")
+responsiveScale.Scale = 1
+responsiveScale.Parent = frame
+
+local frameScale = Instance.new("UIScale")
+frameScale.Scale = 1
+frameScale.Parent = frame
+
+gradient(frame, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 21, 43)),
+    ColorSequenceKeypoint.new(0.5, COLORS.background),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 14, 30)),
+}), 35)
+
+local frameStroke = stroke(frame, accent, 1.7, 0.12)
+local frameStrokeGradient = gradient(frameStroke, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, COLORS.text),
+    ColorSequenceKeypoint.new(0.28, accent),
+    ColorSequenceKeypoint.new(0.72, accentSoft),
+    ColorSequenceKeypoint.new(1, COLORS.text),
+}), 0)
+
+addLoopingTween(frameStroke, 2.2, {Transparency = 0.28, Thickness = 2.25})
+addLoopingTween(shadow, 2.6, {BackgroundTransparency = 0.95})
+
+local function syncShadowPosition()
+    shadow.Position = UDim2.new(
+        frame.Position.X.Scale,
+        frame.Position.X.Offset + 6,
+        frame.Position.Y.Scale,
+        frame.Position.Y.Offset + 7
+    )
+    shadow.Size = UDim2.fromOffset(
+        402 * responsiveScale.Scale,
+        612 * responsiveScale.Scale
+    )
+end
+
+-- The window is 390 wide, the side panel hangs off its right edge
+-- (8px gap + 232px wide), so the whole thing is 630 wide.
+local TOTAL_WIDTH = 630
+local SIDE_OFFSET = 398
+local SIDE_WIDTH = 232
+
+local viewportConnection
+local function fitWindowToViewport()
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local viewport = camera.ViewportSize
+    local fitX = (viewport.X - 24) / TOTAL_WIDTH
+    local fitY = (viewport.Y - 24) / 600
+    responsiveScale.Scale = math.clamp(math.min(fitX, fitY), 0.45, 1)
+    syncShadowPosition()
+end
+
+local function watchCameraViewport(camera)
+    if viewportConnection then
+        viewportConnection:Disconnect()
+        viewportConnection = nil
+    end
+    if camera then
+        viewportConnection = remember(
+            camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitWindowToViewport)
+        )
+    end
+end
+
+fitWindowToViewport()
+-- Shift the window left so the window + side panel together are centred.
+frame.Position = UDim2.new(0.5, -((SIDE_OFFSET + SIDE_WIDTH - 390) / 2) * responsiveScale.Scale, 0.5, 0)
+watchCameraViewport(workspace.CurrentCamera)
+remember(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    watchCameraViewport(workspace.CurrentCamera)
+    fitWindowToViewport()
+end))
+
+---------------------------------------------------------------------
+-- COMMON UI HELPERS
+---------------------------------------------------------------------
+
+local function make(className, properties, parent)
+    local object = Instance.new(className)
+    for property, value in pairs(properties) do
+        object[property] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+local function uiLabel(text, x, y, width, height, parent, options)
+    options = options or {}
+    return make("TextLabel", {
+        Size = UDim2.fromOffset(width, height or 20),
+        Position = UDim2.fromOffset(x, y),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = options.color or COLORS.text,
+        Font = options.font or Enum.Font.GothamMedium,
+        TextSize = options.size or 12,
+        TextXAlignment = options.align or Enum.TextXAlignment.Left,
+        TextYAlignment = options.valign or Enum.TextYAlignment.Center,
+        TextWrapped = options.wrapped or false,
+        TextTruncate = options.truncate and Enum.TextTruncate.AtEnd or Enum.TextTruncate.None,
+        ZIndex = options.zIndex or 4,
+    }, parent)
+end
+
+local function sectionPanel(parent, y, height)
+    local panel = make("Frame", {
+        Position = UDim2.fromOffset(2, y),
+        Size = UDim2.new(1, -4, 0, height),
+        BackgroundColor3 = COLORS.panel,
+        BackgroundTransparency = 0.12,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, parent)
+    round(panel, 12)
+    stroke(panel, accent, 1, 0.72)
+    gradient(panel, ColorSequence.new({
+        ColorSequenceKeypoint.new(0, COLORS.panelRaised),
+        ColorSequenceKeypoint.new(1, COLORS.panel),
+    }), 90)
+    return panel
+end
+
+---------------------------------------------------------------------
+-- BUTTON PAINTING / RIPPLE
+---------------------------------------------------------------------
+
+local function paintButton(button, instant)
+    local meta = buttonMeta[button]
+    if not meta or not button.Parent then
+        return
+    end
+
+    local bg
+    local fg
+    local borderAlpha
+    local borderWidth
+    local scale
+
+    if meta.active then
+        bg = meta.activeColor or accentSoft
+        fg = meta.activeTextColor or COLORS.text
+        borderAlpha = 0.02
+        borderWidth = 1.5
+        scale = meta.hover and 1.025 or 1
+    elseif meta.hover then
+        bg = COLORS.buttonHover
+        fg = COLORS.text
+        borderAlpha = 0.12
+        borderWidth = 1.25
+        scale = 1.025
+    else
+        bg = meta.baseColor or COLORS.button
+        fg = COLORS.text
+        borderAlpha = 0.53
+        borderWidth = 1
+        scale = 1
+    end
+
+    local duration = instant and 0 or 0.16
+    tween(button, duration, {BackgroundColor3 = bg, TextColor3 = fg})
+    tween(meta.stroke, duration, {
+        Color = accent,
+        Transparency = borderAlpha,
+        Thickness = borderWidth,
+    })
+    tween(meta.scale, duration, {Scale = scale}, Enum.EasingStyle.Back)
+end
+
+local function setButtonActive(button, active, activeColor, activeTextColor)
+    local meta = buttonMeta[button]
+    if not meta then
+        return
+    end
+    meta.active = active
+    meta.activeColor = activeColor
+    meta.activeTextColor = activeTextColor
+    paintButton(button, false)
+end
+
+local function ripple(button, input)
+    if not button or not button.Parent or not input then
+        return
+    end
+
+    -- Offsets inside the window are scaled by its UIScales, so convert
+    -- screen pixels back to local units.
+    local uiScale = math.max(responsiveScale.Scale * frameScale.Scale, 0.01)
+    local relativeX = (input.Position.X - button.AbsolutePosition.X) / uiScale
+    local relativeY = (input.Position.Y - button.AbsolutePosition.Y) / uiScale
+    local largest = math.max(button.AbsoluteSize.X, button.AbsoluteSize.Y) / uiScale
+    local size = largest * 2.15
+
+    local circle = make("Frame", {
+        Name = "Ripple",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromOffset(relativeX, relativeY),
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundColor3 = COLORS.text,
+        BackgroundTransparency = 0.67,
+        BorderSizePixel = 0,
+        ZIndex = button.ZIndex + 1,
+    }, button)
+    round(circle, 200)
+
+    tween(circle, 0.44, {
+        Size = UDim2.fromOffset(size, size),
+        BackgroundTransparency = 1,
+    }, Enum.EasingStyle.Quart)
+
+    task.delay(0.5, function()
+        if circle.Parent then
+            circle:Destroy()
+        end
+    end)
+end
+
+local function uiButton(text, x, y, width, height, parent, options)
+    options = options or {}
+    local button = make("TextButton", {
+        Position = UDim2.fromOffset(x, y),
+        Size = UDim2.fromOffset(width, height),
+        BackgroundColor3 = options.baseColor or COLORS.button,
+        BorderSizePixel = 0,
+        Text = text,
+        TextColor3 = options.textColor or COLORS.text,
+        Font = options.font or Enum.Font.GothamBold,
+        TextSize = options.textSize or 11,
+        AutoButtonColor = false,
+        ClipsDescendants = true,
+        ZIndex = options.zIndex or 4,
+    }, parent)
+
+    round(button, options.radius or 8)
+    local buttonStroke = stroke(button, accent, 1, 0.53)
+    gradient(button, ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(208, 199, 226)),
+    }), 90)
+
+    local scale = Instance.new("UIScale")
+    scale.Scale = 1
+    scale.Parent = button
+
+    buttonMeta[button] = {
+        stroke = buttonStroke,
+        scale = scale,
+        hover = false,
+        active = false,
+        baseColor = options.baseColor or COLORS.button,
+        activeColor = options.activeColor,
+        activeTextColor = options.activeTextColor,
+    }
+
+    remember(button.MouseEnter:Connect(function()
+        if buttonMeta[button] then
+            buttonMeta[button].hover = true
+            paintButton(button, false)
+        end
+    end))
+
+    remember(button.MouseLeave:Connect(function()
+        if buttonMeta[button] then
+            buttonMeta[button].hover = false
+            paintButton(button, false)
+        end
+    end))
+
+    remember(button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            ripple(button, input)
+            tween(scale, 0.07, {Scale = 0.95}, Enum.EasingStyle.Quad)
+        end
+    end))
+
+    remember(button.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            task.defer(function()
+                if button.Parent then
+                    paintButton(button, false)
+                end
+            end)
+        end
+    end))
+
+    return button
+end
+
+-- Shrinks long text (like "RANDOM  /  RIGHTCONTROL") to fit the button
+-- instead of overflowing it. Used on the narrower bind buttons.
+local function fitButtonText(button, maxSize)
+    button.TextScaled = true
+    local constraint = Instance.new("UITextSizeConstraint")
+    constraint.MaxTextSize = maxSize or 11
+    constraint.MinTextSize = 6
+    constraint.Parent = button
+end
+
+---------------------------------------------------------------------
+-- TRANSIENT TOAST FEEDBACK
+---------------------------------------------------------------------
+
+local toastFrame = make("Frame", {
+    Name = "Toast",
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, -53),
+    Size = UDim2.fromOffset(270, 38),
+    BackgroundColor3 = COLORS.panelRaised,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 40,
+}, frame)
+round(toastFrame, 10)
+local toastStroke = stroke(toastFrame, accent, 1.2, 1)
+
+local toastDot = make("Frame", {
+    Position = UDim2.fromOffset(12, 15),
+    Size = UDim2.fromOffset(8, 8),
+    BackgroundColor3 = accent,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 42,
+}, toastFrame)
+round(toastDot, 10)
+
+local toastText = make("TextLabel", {
+    Position = UDim2.fromOffset(29, 0),
+    Size = UDim2.new(1, -39, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = COLORS.text,
+    TextTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    ZIndex = 42,
+}, toastFrame)
+
+local toastToken = 0
+local function showToast(message, color)
+    toastToken += 1
+    local token = toastToken
+    local tint = color or accent
+
+    toastFrame.Visible = true
+    toastFrame.Position = UDim2.new(0.5, 0, 0, -53)
+    toastFrame.BackgroundTransparency = 1
+    toastText.Text = message
+    toastText.TextTransparency = 1
+    toastDot.BackgroundColor3 = tint
+    toastDot.BackgroundTransparency = 1
+    toastStroke.Color = tint
+    toastStroke.Transparency = 1
+
+    tween(toastFrame, 0.2, {
+        Position = UDim2.new(0.5, 0, 0, -43),
+        BackgroundTransparency = 0.08,
+    }, Enum.EasingStyle.Back)
+    tween(toastText, 0.18, {TextTransparency = 0})
+    tween(toastDot, 0.18, {BackgroundTransparency = 0})
+    tween(toastStroke, 0.18, {Transparency = 0.18})
+
+    task.delay(1.65, function()
+        if token ~= toastToken or not toastFrame.Parent then
+            return
+        end
+        tween(toastFrame, 0.18, {
+            Position = UDim2.new(0.5, 0, 0, -53),
+            BackgroundTransparency = 1,
+        })
+        tween(toastText, 0.14, {TextTransparency = 1})
+        tween(toastDot, 0.14, {BackgroundTransparency = 1})
+        tween(toastStroke, 0.14, {Transparency = 1})
+        task.delay(0.2, function()
+            if token == toastToken and toastFrame.Parent then
+                toastFrame.Visible = false
+            end
+        end)
+    end)
+end
+
+---------------------------------------------------------------------
+-- HEADER / DRAG / CLOSE
+---------------------------------------------------------------------
+
+local header = make("Frame", {
+    Name = "Header",
+    Position = UDim2.fromOffset(0, 0),
+    Size = UDim2.new(1, 0, 0, 52),
+    BackgroundColor3 = accentSoft,
+    BorderSizePixel = 0,
+    Active = true,
+    ZIndex = 4,
+}, frame)
+round(header, 15)
+local headerGradient = gradient(header, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, THEMES[themeName].deep),
+    ColorSequenceKeypoint.new(0.55, accentSoft),
+    ColorSequenceKeypoint.new(1, THEMES[themeName].deep),
+}), 0)
+headerGradient.Offset = Vector2.new(-1, 0)
+addLoopingTween(headerGradient, 3.4, {Offset = Vector2.new(1, 0)})
+
+local headerBottom = make("Frame", {
+    Position = UDim2.new(0, 13, 1, -2),
+    Size = UDim2.new(1, -26, 0, 2),
+    BackgroundColor3 = accent,
+    BorderSizePixel = 0,
+    ZIndex = 5,
+}, header)
+round(headerBottom, 2)
+
+uiLabel("NEON", 16, 7, 63, 25, header, {
+    size = 19,
+    font = Enum.Font.GothamBlack,
+    zIndex = 6,
+})
+local lockTitle = uiLabel("LOCK", 78, 7, 66, 25, header, {
+    size = 19,
+    font = Enum.Font.GothamBlack,
+    color = accent,
+    zIndex = 6,
+})
+uiLabel("CONTROL DECK  /  CLIENT UI", 17, 31, 260, 13, header, {
+    size = 8,
+    color = COLORS.muted,
+    font = Enum.Font.GothamMedium,
+    zIndex = 6,
+})
+
+local closeButton = uiButton("×", 350, 10, 28, 28, header, {
+    textSize = 19,
+    radius = 8,
+    zIndex = 7,
+})
+local listToggleButton = uiButton("LIST", 304, 10, 42, 28, header, {
+    textSize = 10,
+    radius = 8,
+    zIndex = 7,
+})
+
+---------------------------------------------------------------------
+-- DRAGGING / OPEN-CLOSE ANIMATION
+---------------------------------------------------------------------
+
+local dragging = false
+local dragStart = nil
+local startPosition = nil
+
+remember(header.InputBegan:Connect(function(input)
+    local isPointer = input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    local notCloseButton = input.Position.X < listToggleButton.AbsolutePosition.X
+
+    if isPointer and notCloseButton then
+        dragging = true
+        dragStart = input.Position
+        startPosition = frame.Position
+    end
+end))
+
+remember(UIS.InputChanged:Connect(function(input)
+    if dragging and (
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    ) then
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+        syncShadowPosition()
+    end
+
+    if activeSlider and (
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    ) then
+        activeSlider:update(input.Position.X)
+    end
+end))
+
+local function hideWindow()
+    frame.Visible = false
+    shadow.Visible = false
+end
+
+local function showWindow()
+    frame.Visible = true
+    shadow.Visible = true
+    frameScale.Scale = 0.94
+    tween(frameScale, 0.22, {Scale = 1}, Enum.EasingStyle.Back)
+end
+
+remember(UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+
+        if activeSlider then
+            if activeSlider.knobScale then
+                tween(activeSlider.knobScale, 0.12, {Scale = 1}, Enum.EasingStyle.Back)
+            end
+            activeSlider = nil
+        end
+    end
+end))
+
+-- Since no GUI key is bound by default, closing the window would leave you
+-- with no way to open it again. So the × only closes the window once a GUI
+-- key is bound (and the GUI keybind is switched on).
+remember(closeButton.Activated:Connect(function()
+    if guiKey and guiKeyEnabled then
+        hideWindow()
+    else
+        showToast("BIND A GUI KEY FIRST (SETTINGS)", COLORS.warning)
+    end
+end))
+
+---------------------------------------------------------------------
+-- TABS
+---------------------------------------------------------------------
+
+local tabs = make("Frame", {
+    Position = UDim2.fromOffset(10, 59),
+    Size = UDim2.new(1, -20, 0, 31),
+    BackgroundTransparency = 1,
+    ZIndex = 3,
+}, frame)
+
+local mainTab = uiButton("OVERVIEW", 0, 0, 182, 31, tabs)
+local settingsTab = uiButton("SETTINGS", 188, 0, 182, 31, tabs)
+
+local mainPage
+local settingsPage
+
+local function selectTab(showMain)
+    mainPage.Visible = showMain
+    settingsPage.Visible = not showMain
+    setButtonActive(mainTab, showMain)
+    setButtonActive(settingsTab, not showMain)
+end
+
+---------------------------------------------------------------------
+-- PAGES
+---------------------------------------------------------------------
+
+mainPage = make("ScrollingFrame", {
+    Name = "MainPage",
+    Position = UDim2.fromOffset(10, 99),
+    Size = UDim2.new(1, -20, 1, -109),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = accent,
+    CanvasSize = UDim2.fromOffset(0, 785),
+    Active = true,
+    Visible = true,
+    ZIndex = 2,
+}, frame)
+
+settingsPage = make("Frame", {
+    Name = "SettingsPage",
+    Position = UDim2.fromOffset(10, 99),
+    Size = UDim2.new(1, -20, 1, -109),
+    BackgroundTransparency = 1,
+    Visible = false,
+    ZIndex = 2,
+}, frame)
+
+remember(mainTab.Activated:Connect(function()
+    selectTab(true)
+end))
+remember(settingsTab.Activated:Connect(function()
+    selectTab(false)
+end))
+---------------------------------------------------------------------
+-- STATUS ROW
+---------------------------------------------------------------------
+
+local statusDot = make("Frame", {
+    Position = UDim2.fromOffset(7, 12),
+    Size = UDim2.fromOffset(8, 8),
+    BackgroundColor3 = accent,
+    BorderSizePixel = 0,
+    ZIndex = 4,
+}, mainPage)
+round(statusDot, 20)
+
+local statusLabel = uiLabel("READY  /  UNLOCKED", 21, 5, 320, 22, mainPage, {
+    size = 10,
+    color = COLORS.muted,
+    font = Enum.Font.GothamBold,
+    zIndex = 4,
+    truncate = true,
+})
+
+local function setStatus(message, color)
+    statusLabel.Text = message
+    statusLabel.TextColor3 = color or COLORS.muted
+    statusDot.BackgroundColor3 = color or accent
+end
+
+---------------------------------------------------------------------
+-- TARGET PANEL
+---------------------------------------------------------------------
+
+local targetPanel = sectionPanel(mainPage, 32, 218)
+uiLabel("TARGET SELECTOR", 12, 8, 220, 20, targetPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Choose which body part the camera follows.", 12, 29, 330, 15, targetPanel, {
+    size = 9,
+    color = COLORS.muted,
+})
+
+local partButtons = {}
+
+local function updatePartButtons()
+    for i, partButton in ipairs(partButtons) do
+        local selected = (i == partIndex)
+        setButtonActive(
+            partButton,
+            selected,
+            accent,
+            COLORS.background
+        )
+    end
+end
+
+---------------------------------------------------------------------
+-- TARGET LOCK LOGIC
+---------------------------------------------------------------------
+
+local function updateLockedPart()
+    if not locked or not lockedCharacter then
+        return
+    end
+
+    local selected = parts[partIndex]
+    local target = lockedCharacter:FindFirstChild(selected.r15)
+        or lockedCharacter:FindFirstChild(selected.r6)
+
+    if target and target:IsA("BasePart") then
+        lockedPart = target
+        setStatus(
+            "LOCKED  /  " .. lockedCharacter.Name .. "  /  " .. selected.name,
+            COLORS.good
+        )
+    else
+        lockedPart = nil
+        setStatus("LOCKED  /  WAITING FOR BODY PART", COLORS.warning)
+    end
+end
+
+for i, part in ipairs(parts) do
+    local col = (i - 1) % 2
+    local row = math.floor((i - 1) / 2)
+    local partButton = uiButton(
+        part.name,
+        12 + col * 172,
+        52 + row * 37,
+        164,
+        31,
+        targetPanel
+    )
+    table.insert(partButtons, partButton)
+
+    remember(partButton.Activated:Connect(function()
+        partIndex = i
+        updatePartButtons()
+        updateLockedPart()
+    end))
+end
+
+---------------------------------------------------------------------
+-- CAMERA TUNING PANEL / SLIDERS
+---------------------------------------------------------------------
+
+local tuningPanel = sectionPanel(mainPage, 258, 122)
+uiLabel("CAMERA TUNING", 12, 7, 220, 20, tuningPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Smoothness", 12, 34, 120, 17, tuningPanel, {size = 10})
+local function createSlider(name, y, minValue, maxValue, initial, precision, parent, readoutLabel, callback)
+    local slider = {
+        min = minValue,
+        max = maxValue,
+        value = initial,
+        precision = precision,
+        callback = callback,
+        readout = readoutLabel,
+    }
+
+    slider.bar = make("TextButton", {
+        Position = UDim2.fromOffset(12, y),
+        Size = UDim2.new(1, -24, 0, 10),
+        BackgroundColor3 = COLORS.button,
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        Active = true,
+        ClipsDescendants = false,
+        ZIndex = 4,
+    }, parent)
+    round(slider.bar, 8)
+    stroke(slider.bar, accent, 1, 0.65)
+
+    slider.fill = make("Frame", {
+        Size = UDim2.new((initial - minValue) / (maxValue - minValue), 0, 1, 0),
+        BackgroundColor3 = accent,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, slider.bar)
+    round(slider.fill, 8)
+    slider.fillGradient = gradient(slider.fill, ColorSequence.new(COLORS.text, accent), 0)
+
+    slider.knob = make("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new((initial - minValue) / (maxValue - minValue), 0, 0.5, 0),
+        Size = UDim2.fromOffset(16, 16),
+        BackgroundColor3 = COLORS.text,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, slider.bar)
+    round(slider.knob, 20)
+    slider.knobStroke = stroke(slider.knob, accent, 2, 0)
+    slider.knobScale = Instance.new("UIScale")
+    slider.knobScale.Scale = 1
+    slider.knobScale.Parent = slider.knob
+
+    function slider:update(screenX)
+        local width = self.bar.AbsoluteSize.X
+        if width <= 0 then
+            return
+        end
+
+        local fraction = math.clamp(
+            (screenX - self.bar.AbsolutePosition.X) / width,
+            0,
+            1
+        )
+        local precisionScale = 10 ^ self.precision
+        local rawValue = self.min + fraction * (self.max - self.min)
+        self.value = math.clamp(
+            math.floor(rawValue * precisionScale + 0.5) / precisionScale,
+            self.min,
+            self.max
+        )
+
+        local normalized = (self.value - self.min) / (self.max - self.min)
+        self.fill.Size = UDim2.new(normalized, 0, 1, 0)
+        self.knob.Position = UDim2.new(normalized, 0, 0.5, 0)
+        self.readout.Text = string.format("%s", tostring(self.value))
+        self.callback(self.value)
+    end
+
+    remember(slider.bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            activeSlider = slider
+            slider:update(input.Position.X)
+            tween(slider.knobScale, 0.12, {Scale = 1.22}, Enum.EasingStyle.Back)
+        end
+    end))
+
+    table.insert(sliders, slider)
+    return slider
+end
+
+local smoothnessReadout = uiLabel("5.0", 298, 34, 48, 17, tuningPanel, {
+    size = 10,
+    color = accent,
+    align = Enum.TextXAlignment.Right,
+    font = Enum.Font.GothamBold,
+})
+
+createSlider("Smoothness", 56, 0, 10, smoothness, 1, tuningPanel, smoothnessReadout, function(value)
+    smoothness = value
+end)
+
+uiLabel("Prediction", 12, 76, 120, 17, tuningPanel, {size = 10})
+local predictionReadout = uiLabel("0.00", 298, 76, 48, 17, tuningPanel, {
+    size = 10,
+    color = accent,
+    align = Enum.TextXAlignment.Right,
+    font = Enum.Font.GothamBold,
+})
+
+createSlider("Prediction", 98, 0, 0.5, prediction, 2, tuningPanel, predictionReadout, function(value)
+    prediction = value
+end)
+
+---------------------------------------------------------------------
+-- KEYBINDS PANEL
+---------------------------------------------------------------------
+
+local bindsPanel = sectionPanel(mainPage, 388, 105)
+uiLabel("KEYBINDS", 12, 7, 220, 20, bindsPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Click a bind, press a key (Esc cancels). X unbinds.", 12, 26, 330, 15, bindsPanel, {
+    size = 9,
+    color = COLORS.muted,
+})
+
+-- Each bind button is a little narrower so there is room for a small
+-- "X" button right next to it that unbinds the key.
+local lockButton = uiButton("LOCK  /  NONE", 12, 47, 134, 27, bindsPanel)
+local lockUnbindButton = uiButton("X", 150, 47, 26, 27, bindsPanel)
+local randomButton = uiButton("RANDOM  /  NONE", 184, 47, 134, 27, bindsPanel)
+local randomUnbindButton = uiButton("X", 322, 47, 26, 27, bindsPanel)
+local speedBindButton = uiButton("SPEED  /  NONE", 12, 77, 134, 24, bindsPanel)
+local speedUnbindButton = uiButton("X", 150, 77, 26, 24, bindsPanel)
+local flightBindButton = uiButton("FLIGHT  /  NONE", 184, 77, 134, 24, bindsPanel)
+local flightUnbindButton = uiButton("X", 322, 77, 26, 24, bindsPanel)
+
+fitButtonText(lockButton, 11)
+fitButtonText(randomButton, 11)
+fitButtonText(speedBindButton, 11)
+fitButtonText(flightBindButton, 11)
+
+---------------------------------------------------------------------
+-- SPEED PANEL
+---------------------------------------------------------------------
+
+local speedPanel = sectionPanel(mainPage, 503, 119)
+uiLabel("CFRAME SPEED", 12, 7, 220, 20, speedPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+
+local speedToggleButton = uiButton("SPEED  /  OFF", 12, 33, 164, 29, speedPanel)
+local speedInput = make("TextBox", {
+    Position = UDim2.fromOffset(12, 69),
+    Size = UDim2.fromOffset(164, 30),
+    BackgroundColor3 = COLORS.button,
+    BorderSizePixel = 0,
+    Text = "100",
+    PlaceholderText = "Speed value",
+    PlaceholderColor3 = COLORS.muted,
+    TextColor3 = COLORS.text,
+    ClearTextOnFocus = false,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    ZIndex = 4,
+}, speedPanel)
+round(speedInput, 8)
+stroke(speedInput, accent, 1, 0.48)
+
+local applySpeedButton = uiButton("APPLY SPEED", 184, 69, 164, 30, speedPanel)
+local speedStatus = uiLabel("Speed is disabled.", 184, 33, 164, 29, speedPanel, {
+    size = 9,
+    color = COLORS.muted,
+    wrapped = true,
+})
+
+---------------------------------------------------------------------
+-- FLIGHT PANEL
+---------------------------------------------------------------------
+
+local flightPanel = sectionPanel(mainPage, 632, 119)
+uiLabel("FLIGHT CONTROL", 12, 7, 220, 20, flightPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+
+local flightToggleButton = uiButton("FLIGHT  /  OFF", 12, 33, 164, 29, flightPanel)
+local flightInput = make("TextBox", {
+    Position = UDim2.fromOffset(12, 69),
+    Size = UDim2.fromOffset(164, 30),
+    BackgroundColor3 = COLORS.button,
+    BorderSizePixel = 0,
+    Text = "60",
+    PlaceholderText = "Flight speed",
+    PlaceholderColor3 = COLORS.muted,
+    TextColor3 = COLORS.text,
+    ClearTextOnFocus = false,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    ZIndex = 4,
+}, flightPanel)
+round(flightInput, 8)
+stroke(flightInput, accent, 1, 0.48)
+
+local applyFlightSpeedButton = uiButton("APPLY FLIGHT SPEED", 184, 69, 164, 30, flightPanel)
+local flightStatus = uiLabel("WASD · Space · Ctrl", 184, 33, 164, 29, flightPanel, {
+    size = 9,
+    color = COLORS.muted,
+    wrapped = true,
+})
+
+mainPage.CanvasSize = UDim2.fromOffset(0, 765)
+
+---------------------------------------------------------------------
+-- TARGET SEARCH / LOCK
+---------------------------------------------------------------------
+
+local function getTarget()
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return nil, nil
+    end
+
+    -- GetMouseLocation and WorldToViewportPoint are both in viewport space
+    -- (origin = top-left of the whole window), so they compare directly.
+    local mousePosition = UIS:GetMouseLocation()
+    local bestDistance = 150
+    local bestPart = nil
+    local bestCharacter = nil
+
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player and other.Character then
+            local character = other.Character
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            local selected = parts[partIndex]
+            local target = character:FindFirstChild(selected.r15)
+                or character:FindFirstChild(selected.r6)
+
+            if humanoid and humanoid.Health > 0
+                and target and target:IsA("BasePart") then
+                local viewportPosition, visible = camera:WorldToViewportPoint(target.Position)
+                if visible and viewportPosition.Z > 0 then
+                    local distance = (
+                        Vector2.new(viewportPosition.X, viewportPosition.Y) - mousePosition
+                    ).Magnitude
+                    if distance < bestDistance then
+                        bestDistance = distance
+                        bestPart = target
+                        bestCharacter = character
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPart, bestCharacter
+end
+
+local function unlock()
+    locked = false
+    lockedPart = nil
+    lockedCharacter = nil
+    lockedPlayer = nil
+    setStatus("READY  /  UNLOCKED", COLORS.muted)
+    setButtonActive(lockButton, false)
+    if refreshPlayerRows then
+        refreshPlayerRows()
+    end
+    showToast("TARGET UNLOCKED", COLORS.muted)
+end
+
+-- Lock the camera onto a specific player (the selected target).
+local function startLock(target)
+    if not target or target.Parent ~= Players or target == player then
+        return false
+    end
+
+    locked = true
+    lockedPlayer = target
+    lockedCharacter = target.Character
+    lockedPart = nil
+    setButtonActive(lockButton, true, accent, COLORS.background)
+
+    if lockedCharacter then
+        updateLockedPart()
+    else
+        setStatus("LOCKED  /  WAITING FOR RESPAWN", COLORS.warning)
+    end
+
+    if refreshPlayerRows then
+        refreshPlayerRows()
+    end
+    showToast("LOCKED  /  " .. target.DisplayName, COLORS.good)
+    return true
+end
+
+-- Clears the selected target (and releases the camera lock if it was on them).
+local function clearSelection()
+    if not selectedPlayer then
+        showToast("NO TARGET SELECTED", COLORS.muted)
+        return
+    end
+
+    local clearedPlayer = selectedPlayer
+    selectedPlayer = nil
+    if locked and lockedPlayer == clearedPlayer then
+        unlock()
+    end
+    if refreshPlayerRows then
+        refreshPlayerRows()
+    end
+    showToast("TARGET CLEARED", COLORS.muted)
+end
+
+-- Select (or deselect) a player as the target. This never locks and never
+-- changes who you are locked onto.
+local function selectPlayer(target)
+    if not target or target.Parent ~= Players or target == player then
+        return
+    end
+
+    if selectedPlayer == target then
+        clearSelection()
+        return
+    end
+
+    selectedPlayer = target
+    if refreshPlayerRows then
+        refreshPlayerRows()
+    end
+    showToast("TARGET  /  " .. target.DisplayName, accent)
+end
+
+local function toggleLock()
+    if locked then
+        unlock()
+        return
+    end
+
+    -- Player nearest the cursor first; this does not select them in the list.
+    local target, character = getTarget()
+    local targetPlayer = character and Players:GetPlayerFromCharacter(character)
+    if target and targetPlayer and startLock(targetPlayer) then
+        return
+    end
+
+    -- Nobody near the cursor: fall back to the selected player, if any.
+    if selectedPlayer and startLock(selectedPlayer) then
+        return
+    end
+
+    setStatus("NO TARGET  /  AIM CLOSER TO A PLAYER", COLORS.warning)
+    showToast("NO TARGET IN RANGE", COLORS.warning)
+end
+
+---------------------------------------------------------------------
+-- SPEED / FLIGHT TOGGLES
+---------------------------------------------------------------------
+
+local function refreshSpeedUI()
+    speedToggleButton.Text = speedEnabled and "SPEED  /  ON" or "SPEED  /  OFF"
+    setButtonActive(speedToggleButton, speedEnabled, accent, COLORS.background)
+    speedStatus.Text = speedEnabled
+        and ("Enabled · " .. tostring(walkSpeed) .. " studs/s")
+        or "Speed is disabled."
+    speedStatus.TextColor3 = speedEnabled and COLORS.good or COLORS.muted
+end
+
+local function applySpeedValue()
+    local value = tonumber(speedInput.Text)
+    if not value then
+        speedStatus.Text = "Enter a valid number."
+        speedStatus.TextColor3 = COLORS.warning
+        return
+    end
+
+    walkSpeed = math.clamp(value, 0, 500)
+    speedInput.Text = tostring(walkSpeed)
+    refreshSpeedUI()
+    showToast("SPEED SET  /  " .. tostring(walkSpeed), accent)
+end
+
+local function toggleSpeed()
+    speedEnabled = not speedEnabled
+    refreshSpeedUI()
+    showToast(speedEnabled and "CFRAME SPEED ENABLED" or "CFRAME SPEED DISABLED", speedEnabled and COLORS.good or COLORS.muted)
+end
+
+local function refreshFlightUI()
+    flightToggleButton.Text = flightEnabled and "FLIGHT  /  ON" or "FLIGHT  /  OFF"
+    setButtonActive(flightToggleButton, flightEnabled, accent, COLORS.background)
+    flightStatus.Text = flightEnabled
+        and ("Active · " .. tostring(flightSpeed) .. " studs/s")
+        or "WASD · Space · Ctrl"
+    flightStatus.TextColor3 = flightEnabled and COLORS.good or COLORS.muted
+end
+
+local function toggleFlight()
+    flightEnabled = not flightEnabled
+    refreshFlightUI()
+    showToast(flightEnabled and "FLIGHT ENABLED" or "FLIGHT DISABLED", flightEnabled and COLORS.good or COLORS.muted)
+
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        if flightEnabled then
+            humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+        else
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end
+end
+
+local function applyFlightSpeedValue()
+    local value = tonumber(flightInput.Text)
+    if not value then
+        flightStatus.Text = "Enter a valid flight speed."
+        flightStatus.TextColor3 = COLORS.warning
+        return
+    end
+
+    flightSpeed = math.clamp(value, 1, 500)
+    flightInput.Text = tostring(flightSpeed)
+    refreshFlightUI()
+    showToast("FLIGHT SPEED SET  /  " .. tostring(flightSpeed), accent)
+end
+
+remember(speedToggleButton.Activated:Connect(toggleSpeed))
+remember(applySpeedButton.Activated:Connect(applySpeedValue))
+remember(flightToggleButton.Activated:Connect(toggleFlight))
+remember(applyFlightSpeedButton.Activated:Connect(applyFlightSpeedValue))
+
+---------------------------------------------------------------------
+-- SIDE PANEL: PLAYER LIST + ESP CONTROLS
+---------------------------------------------------------------------
+
+local sidePanel = make("Frame", {
+    Name = "PlayerPanel",
+    Position = UDim2.fromOffset(SIDE_OFFSET, 0),
+    Size = UDim2.fromOffset(SIDE_WIDTH, 600),
+    BackgroundColor3 = COLORS.background,
+    BorderSizePixel = 0,
+    ZIndex = 2,
+}, frame)
+round(sidePanel, 16)
+stroke(sidePanel, accent, 1.5, 0.2)
+gradient(sidePanel, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 21, 43)),
+    ColorSequenceKeypoint.new(0.5, COLORS.background),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 14, 30)),
+}), 35)
+
+local function setPlayerPanelOpen(open)
+    sidePanel.Visible = open
+    setButtonActive(listToggleButton, open)
+end
+
+remember(listToggleButton.Activated:Connect(function()
+    setPlayerPanelOpen(not sidePanel.Visible)
+end))
+
+uiLabel("PLAYER LIST", 14, 10, 120, 20, sidePanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+local playerCountLabel = uiLabel("0 PLAYERS", 96, 10, 94, 20, sidePanel, {
+    size = 10,
+    color = accent,
+    align = Enum.TextXAlignment.Right,
+    font = Enum.Font.GothamBold,
+})
+local targetLabel = uiLabel("Click a player to select them.", 14, 30, 204, 15, sidePanel, {
+    size = 9,
+    color = COLORS.muted,
+    truncate = true,
+})
+
+remember(uiButton("×", 196, 8, 24, 24, sidePanel, {textSize = 16, radius = 7}).Activated:Connect(function()
+    setPlayerPanelOpen(false)
+end))
+
+local searchBox = make("TextBox", {
+    Name = "Search",
+    Position = UDim2.fromOffset(10, 50),
+    Size = UDim2.fromOffset(212, 26),
+    BackgroundColor3 = COLORS.button,
+    BorderSizePixel = 0,
+    Text = "",
+    PlaceholderText = "Search name or @username",
+    PlaceholderColor3 = COLORS.muted,
+    TextColor3 = COLORS.text,
+    ClearTextOnFocus = false,
+    ClipsDescendants = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    ZIndex = 4,
+}, sidePanel)
+round(searchBox, 8)
+stroke(searchBox, accent, 1, 0.48)
+make("UIPadding", {
+    PaddingLeft = UDim.new(0, 9),
+    PaddingRight = UDim.new(0, 9),
+}, searchBox)
+
+local playerList = make("ScrollingFrame", {
+    Name = "PlayerList",
+    Position = UDim2.fromOffset(10, 82),
+    Size = UDim2.fromOffset(212, 186),
+    BackgroundColor3 = COLORS.panel,
+    BackgroundTransparency = 0.12,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = accent,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    Active = true,
+    ZIndex = 3,
+}, sidePanel)
+round(playerList, 10)
+stroke(playerList, accent, 1, 0.72)
+make("UIListLayout", {
+    Padding = UDim.new(0, 5),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, playerList)
+make("UIPadding", {
+    PaddingTop = UDim.new(0, 6),
+    PaddingBottom = UDim.new(0, 6),
+    PaddingLeft = UDim.new(0, 6),
+    PaddingRight = UDim.new(0, 8),
+}, playerList)
+
+local emptyListLabel = uiLabel("NO OTHER PLAYERS", 10, 165, 212, 20, sidePanel, {
+    size = 10,
+    color = COLORS.muted,
+    align = Enum.TextXAlignment.Center,
+    font = Enum.Font.GothamBold,
+    zIndex = 5,
+})
+
+local function createPlayerRow(other)
+    local label = other.DisplayName
+    if other.DisplayName ~= other.Name then
+        label = other.DisplayName .. "  (@" .. other.Name .. ")"
+    end
+
+    local row = uiButton(label, 0, 0, 198, 30, playerList, {radius = 8})
+    row.Size = UDim2.new(1, 0, 0, 30)
+    fitButtonText(row, 11)
+    playerRows[other] = row
+
+    remember(row.Activated:Connect(function()
+        selectPlayer(other)
+    end))
+end
+
+-- Keeps one row per player (created on join, destroyed on leave) and just
+-- re-sorts / shows / hides them for the search filter. `ignore` is used by
+-- PlayerRemoving, where the leaving player is still in GetPlayers().
+local function rebuildPlayerList(ignore)
+    local others = {}
+    local present = {}
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player and other ~= ignore then
+            table.insert(others, other)
+            present[other] = true
+        end
+    end
+
+    table.sort(others, function(a, b)
+        return string.lower(a.DisplayName) < string.lower(b.DisplayName)
+    end)
+
+    for other, row in pairs(playerRows) do
+        if not present[other] then
+            buttonMeta[row] = nil
+            row:Destroy()
+            playerRows[other] = nil
+        end
+    end
+
+    local query = string.lower((searchBox.Text:gsub("^%s+", ""):gsub("%s+$", "")))
+    query = (query:gsub("^@", ""))
+
+    local shown = 0
+    for index, other in ipairs(others) do
+        if not playerRows[other] then
+            createPlayerRow(other)
+        end
+
+        local row = playerRows[other]
+        row.LayoutOrder = index
+
+        local matches = query == ""
+            or string.find(string.lower(other.DisplayName), query, 1, true) ~= nil
+            or string.find(string.lower(other.Name), query, 1, true) ~= nil
+        row.Visible = matches
+        if matches then
+            shown += 1
+        end
+    end
+
+    emptyListLabel.Text = (#others == 0) and "NO OTHER PLAYERS" or "NO MATCHES"
+    emptyListLabel.Visible = (shown == 0)
+    if query == "" then
+        playerCountLabel.Text = tostring(#others) .. (#others == 1 and " PLAYER" or " PLAYERS")
+    else
+        playerCountLabel.Text = tostring(shown) .. " / " .. tostring(#others)
+    end
+    refreshPlayerRows()
+end
+
+remember(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    rebuildPlayerList()
+end))
+
+local lockTargetButton = uiButton("LOCK ONTO TARGET  /  OFF", 10, 276, 212, 28, sidePanel)
+fitButtonText(lockTargetButton, 11)
+remember(lockTargetButton.Activated:Connect(function()
+    if not selectedPlayer then
+        showToast("SELECT A PLAYER FIRST", COLORS.warning)
+    elseif locked and lockedPlayer == selectedPlayer then
+        unlock()
+    else
+        startLock(selectedPlayer)
+    end
+end))
+
+remember(uiButton("DESELECT TARGET", 10, 308, 212, 28, sidePanel).Activated:Connect(function()
+    clearSelection()
+end))
+
+-- Repaints the list highlight, the target caption and the lock button.
+refreshPlayerRows = function()
+    for other, row in pairs(playerRows) do
+        setButtonActive(row, selectedPlayer == other, accent, COLORS.background)
+    end
+    targetLabel.Text = selectedPlayer
+        and ("Target: " .. selectedPlayer.DisplayName)
+        or "Click a player to select them."
+    -- ON only while the camera is locked onto the *selected* player.
+    local lockedOnSelected = locked and selectedPlayer ~= nil and lockedPlayer == selectedPlayer
+    lockTargetButton.Text = "LOCK ONTO TARGET  /  " .. (lockedOnSelected and "ON" or "OFF")
+    setButtonActive(lockTargetButton, lockedOnSelected, accent, COLORS.background)
+end
+
+-- ESP controls ------------------------------------------------------
+
+uiLabel("ESP", 14, 344, 120, 20, sidePanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Box, glow and a torso tracer.", 14, 362, 204, 15, sidePanel, {
+    size = 9,
+    color = COLORS.muted,
+})
+
+local targetEspButton = uiButton("TARGET ESP  /  OFF", 10, 384, 102, 30, sidePanel)
+local espAllButton = uiButton("ESP ALL  /  OFF", 120, 384, 102, 30, sidePanel)
+local boxButton = uiButton("BOX  /  ON", 10, 420, 102, 28, sidePanel)
+local glowButton = uiButton("GLOW  /  ON", 120, 420, 102, 28, sidePanel)
+local tracerButton = uiButton("TRACER  /  ON", 10, 454, 102, 28, sidePanel)
+local nameButton = uiButton("NAME  /  ON", 120, 454, 102, 28, sidePanel)
+local espColorButton = uiButton("ESP COLOR  /  THEME", 10, 488, 212, 28, sidePanel)
+
+fitButtonText(targetEspButton, 11)
+fitButtonText(espAllButton, 11)
+fitButtonText(boxButton, 11)
+fitButtonText(glowButton, 11)
+fitButtonText(tracerButton, 11)
+fitButtonText(nameButton, 11)
+
+uiLabel("ESP follows the selected player, no lock needed. The tracer runs from the bottom of your screen to their torso.", 14, 524, 204, 54, sidePanel, {
+    size = 9,
+    color = COLORS.muted,
+    wrapped = true,
+    valign = Enum.TextYAlignment.Top,
+})
+
+local function onOff(value)
+    return value and "ON" or "OFF"
+end
+
+local function refreshEspUI()
+    targetEspButton.Text = "TARGET ESP  /  " .. onOff(espTargetEnabled)
+    espAllButton.Text = "ESP ALL  /  " .. onOff(espAllEnabled)
+    boxButton.Text = "BOX  /  " .. onOff(espBoxEnabled)
+    glowButton.Text = "GLOW  /  " .. onOff(espGlowEnabled)
+    tracerButton.Text = "TRACER  /  " .. onOff(espTracerEnabled)
+    nameButton.Text = "NAME  /  " .. onOff(espNameEnabled)
+    espColorButton.Text = "ESP COLOR  /  " .. ESP_COLORS[espColorIndex].name
+
+    setButtonActive(targetEspButton, espTargetEnabled, accent, COLORS.background)
+    setButtonActive(espAllButton, espAllEnabled, accent, COLORS.background)
+    setButtonActive(boxButton, espBoxEnabled, accent, COLORS.background)
+    setButtonActive(glowButton, espGlowEnabled, accent, COLORS.background)
+    setButtonActive(tracerButton, espTracerEnabled, accent, COLORS.background)
+    setButtonActive(nameButton, espNameEnabled, accent, COLORS.background)
+end
+
+local function connectEspToggle(button, label, getValue, setValue)
+    remember(button.Activated:Connect(function()
+        setValue(not getValue())
+        refreshEspUI()
+        local enabled = getValue()
+        showToast(label .. (enabled and "  ENABLED" or "  DISABLED"), enabled and COLORS.good or COLORS.muted)
+    end))
+end
+
+connectEspToggle(targetEspButton, "TARGET ESP", function()
+    return espTargetEnabled
+end, function(value)
+    espTargetEnabled = value
+end)
+
+connectEspToggle(espAllButton, "ESP ALL", function()
+    return espAllEnabled
+end, function(value)
+    espAllEnabled = value
+end)
+
+connectEspToggle(boxButton, "ESP BOX", function()
+    return espBoxEnabled
+end, function(value)
+    espBoxEnabled = value
+end)
+
+connectEspToggle(glowButton, "ESP GLOW", function()
+    return espGlowEnabled
+end, function(value)
+    espGlowEnabled = value
+end)
+
+connectEspToggle(tracerButton, "ESP TRACER", function()
+    return espTracerEnabled
+end, function(value)
+    espTracerEnabled = value
+end)
+
+connectEspToggle(nameButton, "ESP NAME", function()
+    return espNameEnabled
+end, function(value)
+    espNameEnabled = value
+end)
+
+remember(espColorButton.Activated:Connect(function()
+    espColorIndex = espColorIndex % #ESP_COLORS + 1
+    refreshEspUI()
+    showToast("ESP COLOR  /  " .. ESP_COLORS[espColorIndex].name, ESP_COLORS[espColorIndex].color or accent)
+end))
+
+---------------------------------------------------------------------
+-- ESP ENGINE (boxes, glow, name/info, torso tracer)
+---------------------------------------------------------------------
+
+-- Separate full-screen ScreenGui that ignores the top-bar inset, so GUI
+-- pixels line up exactly with camera:WorldToViewportPoint coordinates.
+local espGui = Instance.new("ScreenGui")
+espGui.Name = "NeonLockESP"
+espGui.ResetOnSpawn = false
+espGui.IgnoreGuiInset = true
+espGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+espGui.DisplayOrder = 10
+pcall(function()
+    espGui.ScreenInsets = Enum.ScreenInsets.None
+end)
+espGui.Parent = playerGui
+
+local WHITE = Color3.new(1, 1, 1)
+local BLACK = Color3.new(0, 0, 0)
+local HEALTH_LOW = Color3.fromRGB(255, 70, 70)
+local HEALTH_HIGH = Color3.fromRGB(80, 255, 120)
+
+local function getEspColor()
+    return ESP_COLORS[espColorIndex].color or accent
+end
+
+local function createEsp()
+    local obj = {}
+
+    obj.root = make("Frame", {
+        Name = "ESP",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 1,
+    }, espGui)
+
+    obj.box = make("Frame", {
+        Name = "Box",
+        BackgroundColor3 = WHITE,
+        BackgroundTransparency = 0.9,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 2,
+    }, obj.root)
+    obj.boxStroke = stroke(obj.box, WHITE, 1.5, 0)
+
+    obj.healthBack = make("Frame", {
+        Name = "HealthBack",
+        BackgroundColor3 = BLACK,
+        BackgroundTransparency = 0.35,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 2,
+    }, obj.root)
+    obj.healthFill = make("Frame", {
+        Name = "HealthFill",
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.fromScale(0, 1),
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = HEALTH_HIGH,
+        BorderSizePixel = 0,
+        ZIndex = 3,
+    }, obj.healthBack)
+
+    obj.nameLabel = make("TextLabel", {
+        Name = "Name",
+        Size = UDim2.fromOffset(200, 14),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = WHITE,
+        TextStrokeColor3 = BLACK,
+        TextStrokeTransparency = 0.35,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        Visible = false,
+        ZIndex = 4,
+    }, obj.root)
+
+    obj.infoLabel = make("TextLabel", {
+        Name = "Info",
+        Size = UDim2.fromOffset(200, 13),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = WHITE,
+        TextStrokeColor3 = BLACK,
+        TextStrokeTransparency = 0.4,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 10,
+        Visible = false,
+        ZIndex = 4,
+    }, obj.root)
+
+    obj.tracer = make("Frame", {
+        Name = "Tracer",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(0, 2),
+        BackgroundColor3 = WHITE,
+        BackgroundTransparency = 0.05,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 2,
+    }, obj.root)
+
+    obj.tracerDot = make("Frame", {
+        Name = "TracerDot",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(8, 8),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 3,
+    }, obj.root)
+    round(obj.tracerDot, 8)
+
+    obj.highlight = nil
+    return obj
+end
+
+local function hideEsp(obj)
+    if obj.root.Visible then
+        obj.root.Visible = false
+    end
+    if obj.highlight and obj.highlight.Enabled then
+        obj.highlight.Enabled = false
+    end
+end
+
+local function destroyEsp(obj)
+    if obj.highlight then
+        obj.highlight:Destroy()
+        obj.highlight = nil
+    end
+    if obj.root then
+        obj.root:Destroy()
+    end
+end
+
+local function updateEspFor(other, isTarget, camera, screenSize, color)
+    local obj = espObjects[other]
+    if not obj then
+        obj = createEsp()
+        espObjects[other] = obj
+    end
+
+    local character = other.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    -- The tracer always uses the torso (R15 UpperTorso, R6 Torso), falling
+    -- back to the root part only if neither exists.
+    local torso = character and (
+        character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or root
+    )
+
+    if not humanoid or not root or not torso
+        or not root:IsA("BasePart") or not torso:IsA("BasePart")
+        or humanoid.Health <= 0 then
+        hideEsp(obj)
+        return
+    end
+
+    obj.root.Visible = true
+    local thickness = isTarget and 2.5 or 1.5
+
+    -- GLOW (Highlight) ------------------------------------------------
+    if espGlowEnabled then
+        local highlight = obj.highlight
+        if not highlight or highlight.Parent ~= character then
+            if highlight then
+                highlight:Destroy()
+            end
+            highlight = Instance.new("Highlight")
+            highlight.Name = "NeonLockHighlight"
+            highlight.Adornee = character
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.OutlineTransparency = 0.1
+            highlight.Parent = character
+            obj.highlight = highlight
+        end
+        highlight.Enabled = true
+        highlight.FillColor = color
+        highlight.OutlineColor = color:Lerp(WHITE, 0.35)
+        highlight.FillTransparency = isTarget and 0.5 or 0.72
+    elseif obj.highlight then
+        obj.highlight.Enabled = false
+    end
+
+    -- BOX / HEALTH / NAME ---------------------------------------------
+    -- Fixed-size upright box around the root part so it never wobbles with
+    -- animations or accessories.
+    local rootPosition = root.Position
+    local topPoint = camera:WorldToViewportPoint(rootPosition + Vector3.new(0, 3, 0))
+    local bottomPoint = camera:WorldToViewportPoint(rootPosition - Vector3.new(0, 3.5, 0))
+    local inFront = topPoint.Z > 0 and bottomPoint.Z > 0
+
+    if inFront then
+        local height = math.max(math.abs(bottomPoint.Y - topPoint.Y), 4)
+        local width = height * 0.58
+        local centerX = (topPoint.X + bottomPoint.X) / 2
+        local topY = math.min(topPoint.Y, bottomPoint.Y)
+        local left = centerX - width / 2
+        local fraction = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+
+        if espBoxEnabled then
+            obj.box.Position = UDim2.fromOffset(left, topY)
+            obj.box.Size = UDim2.fromOffset(width, height)
+            obj.box.BackgroundColor3 = color
+            obj.box.BackgroundTransparency = isTarget and 0.8 or 0.9
+            obj.boxStroke.Color = color
+            obj.boxStroke.Thickness = thickness
+            obj.box.Visible = true
+
+            obj.healthBack.Position = UDim2.fromOffset(left - 6, topY)
+            obj.healthBack.Size = UDim2.fromOffset(3, height)
+            obj.healthFill.Size = UDim2.fromScale(1, fraction)
+            obj.healthFill.BackgroundColor3 = HEALTH_LOW:Lerp(HEALTH_HIGH, fraction)
+            obj.healthBack.Visible = true
+        else
+            obj.box.Visible = false
+            obj.healthBack.Visible = false
+        end
+
+        if espNameEnabled then
+            local distance = (camera.CFrame.Position - rootPosition).Magnitude
+            obj.nameLabel.Position = UDim2.fromOffset(centerX - 100, topY - 16)
+            obj.nameLabel.Text = (isTarget and "[TARGET]  " or "") .. other.DisplayName
+            obj.nameLabel.TextColor3 = color
+            obj.nameLabel.Visible = true
+
+            obj.infoLabel.Position = UDim2.fromOffset(centerX - 100, topY + height + 2)
+            obj.infoLabel.Text = string.format(
+                "%d studs  |  %d HP",
+                math.floor(distance + 0.5),
+                math.floor(humanoid.Health + 0.5)
+            )
+            obj.infoLabel.Visible = true
+        else
+            obj.nameLabel.Visible = false
+            obj.infoLabel.Visible = false
+        end
+    else
+        obj.box.Visible = false
+        obj.healthBack.Visible = false
+        obj.nameLabel.Visible = false
+        obj.infoLabel.Visible = false
+    end
+
+    -- TRACER ------------------------------------------------------------
+    -- From the bottom-centre of the screen to the target's torso.
+    if espTracerEnabled then
+        local startPoint = Vector2.new(screenSize.X / 2, screenSize.Y)
+        local torsoPoint = camera:WorldToViewportPoint(torso.Position)
+        local torsoInFront = torsoPoint.Z > 0
+        local finishPoint
+
+        if torsoInFront then
+            finishPoint = Vector2.new(torsoPoint.X, torsoPoint.Y)
+        else
+            -- Behind the camera the projected point is mirrored, so use the
+            -- real direction (in camera space) and point the tracer that way.
+            local relative = camera.CFrame:PointToObjectSpace(torso.Position)
+            local direction = Vector2.new(relative.X, -relative.Y)
+            if direction.Magnitude < 0.01 then
+                direction = Vector2.new(0, 1)
+            end
+            finishPoint = screenSize / 2 + direction.Unit * screenSize.Magnitude
+        end
+
+        local delta = finishPoint - startPoint
+        local length = delta.Magnitude
+        if length > 6000 then
+            delta = delta.Unit * 6000
+            finishPoint = startPoint + delta
+            length = 6000
+        end
+
+        local middle = startPoint + delta / 2
+        obj.tracer.Position = UDim2.fromOffset(middle.X, middle.Y)
+        obj.tracer.Size = UDim2.fromOffset(length, thickness)
+        obj.tracer.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+        obj.tracer.BackgroundColor3 = color
+        obj.tracer.Visible = true
+
+        obj.tracerDot.Position = UDim2.fromOffset(finishPoint.X, finishPoint.Y)
+        obj.tracerDot.BackgroundColor3 = color
+        obj.tracerDot.Visible = torsoInFront
+    else
+        obj.tracer.Visible = false
+        obj.tracerDot.Visible = false
+    end
+end
+
+local function updateEsp()
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local screenSize = espGui.AbsoluteSize
+    local color = getEspColor()
+    local targetPlayer = selectedPlayer
+
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player then
+            local isTarget = (targetPlayer ~= nil and other == targetPlayer)
+            local shouldShow = espAllEnabled or (espTargetEnabled and isTarget)
+
+            if shouldShow then
+                updateEspFor(other, isTarget, camera, screenSize, color)
+            else
+                local obj = espObjects[other]
+                if obj then
+                    hideEsp(obj)
+                end
+            end
+        end
+    end
+end
+
+-- Runs after the camera-lock step so the tracer/box use the final camera.
+RunService:BindToRenderStep(
+    "NeonLockESP",
+    Enum.RenderPriority.Camera.Value + 2,
+    updateEsp
+)
+
+remember(Players.PlayerAdded:Connect(function()
+    rebuildPlayerList()
+end))
+
+remember(Players.PlayerRemoving:Connect(function(leaving)
+    local obj = espObjects[leaving]
+    if obj then
+        destroyEsp(obj)
+        espObjects[leaving] = nil
+    end
+    if leaving == selectedPlayer then
+        selectedPlayer = nil
+        if locked and lockedPlayer == leaving then
+            unlock()
+        end
+    end
+    rebuildPlayerList(leaving)
+end))
+
+---------------------------------------------------------------------
+-- KEYBIND CAPTURE
+---------------------------------------------------------------------
+
+-- Created later (Settings page); declared here so the helpers below can use it.
+local guiKeyButton
+local guiUnbindButton
+
+local bindButtons = {
+    Lock = lockButton,
+    Random = randomButton,
+    Speed = speedBindButton,
+    Flight = flightBindButton,
+}
+
+local function refreshBindButtonNames()
+    lockButton.Text = "LOCK  /  " .. keyText(lockKey)
+    randomButton.Text = "RANDOM  /  " .. keyText(randomKey)
+    speedBindButton.Text = "SPEED  /  " .. keyText(speedKey)
+    flightBindButton.Text = "FLIGHT  /  " .. keyText(flightKey)
+    if guiKeyButton then
+        guiKeyButton.Text = "GUI KEY  /  " .. keyText(guiKey)
+    end
+end
+
+local function beginListening(action, button, promptText)
+    -- If another bind button was already waiting for a key, put it back.
+    if listeningButton and listeningButton ~= button then
+        setButtonActive(listeningButton, false)
+        if listeningButton == lockButton and locked then
+            setButtonActive(lockButton, true, accent, COLORS.background)
+        end
+        refreshBindButtonNames()
+    end
+
+    listening = action
+    listeningButton = button
+    button.Text = promptText or "PRESS A KEY"
+    setButtonActive(button, true, accentSoft, COLORS.text)
+end
+
+remember(lockButton.Activated:Connect(function()
+    beginListening("Lock", lockButton)
+end))
+remember(randomButton.Activated:Connect(function()
+    beginListening("Random", randomButton)
+end))
+remember(speedBindButton.Activated:Connect(function()
+    beginListening("Speed", speedBindButton)
+end))
+remember(flightBindButton.Activated:Connect(function()
+    beginListening("Flight", flightBindButton)
+end))
+
+---------------------------------------------------------------------
+-- UNBINDING (the little "X" buttons)
+---------------------------------------------------------------------
+
+local function unbindAction(action)
+    local button = (action == "GUI") and guiKeyButton or bindButtons[action]
+
+    -- If this bind was waiting for a key press, stop waiting.
+    if listening == action then
+        listening = nil
+        listeningButton = nil
+        if button then
+            setButtonActive(button, false)
+        end
+    end
+
+    if action == "Lock" then
+        lockKey = nil
+    elseif action == "Random" then
+        randomKey = nil
+    elseif action == "Speed" then
+        speedKey = nil
+    elseif action == "Flight" then
+        flightKey = nil
+    elseif action == "GUI" then
+        guiKey = nil
+    end
+
+    refreshBindButtonNames()
+
+    if action == "Lock" and locked then
+        setButtonActive(lockButton, true, accent, COLORS.background)
+    end
+
+    showToast(action:upper() .. " KEY UNBOUND", COLORS.muted)
+end
+
+remember(lockUnbindButton.Activated:Connect(function()
+    unbindAction("Lock")
+end))
+remember(randomUnbindButton.Activated:Connect(function()
+    unbindAction("Random")
+end))
+remember(speedUnbindButton.Activated:Connect(function()
+    unbindAction("Speed")
+end))
+remember(flightUnbindButton.Activated:Connect(function()
+    unbindAction("Flight")
+end))
+
+---------------------------------------------------------------------
+-- SETTINGS PAGE
+---------------------------------------------------------------------
+
+local appearancePanel = sectionPanel(settingsPage, 2, 112)
+uiLabel("APPEARANCE", 12, 8, 220, 20, appearancePanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Switch the complete accent palette.", 12, 29, 330, 15, appearancePanel, {
+    size = 9,
+    color = COLORS.muted,
+})
+
+local purpleButton = uiButton("PURPLE  /  NEON", 12, 54, 164, 34, appearancePanel)
+local greenButton = uiButton("GREEN  /  MATRIX", 184, 54, 164, 34, appearancePanel)
+
+local shortcutPanel = sectionPanel(settingsPage, 126, 172)
+uiLabel("GUI VISIBILITY", 12, 8, 220, 20, shortcutPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Set a key to show or hide this window.", 12, 29, 330, 15, shortcutPanel, {
+    size = 9,
+    color = COLORS.muted,
+})
+
+guiKeyButton = uiButton("GUI KEY  /  NONE", 12, 53, 296, 31, shortcutPanel)
+guiUnbindButton = uiButton("X", 316, 53, 32, 31, shortcutPanel)
+fitButtonText(guiKeyButton, 11)
+bindButtons.GUI = guiKeyButton
+
+local guiToggleButton = uiButton("GUI KEYBIND  /  ON", 12, 91, 336, 31, shortcutPanel)
+uiLabel("Bind a GUI key before closing: the × only works once one is set.", 12, 132, 330, 30, shortcutPanel, {
+    size = 9,
+    color = COLORS.muted,
+    wrapped = true,
+    valign = Enum.TextYAlignment.Top,
+})
+
+local helpPanel = sectionPanel(settingsPage, 310, 118)
+uiLabel("CONTROLS", 12, 8, 220, 20, helpPanel, {
+    size = 12,
+    font = Enum.Font.GothamBold,
+})
+uiLabel("Flight: WASD move · Space rise · LeftControl descend", 12, 35, 330, 18, helpPanel, {
+    size = 9,
+    color = COLORS.muted,
+})
+uiLabel("Lock key locks whoever is nearest your cursor. Or select a player and press LOCK ONTO TARGET.", 12, 57, 330, 32, helpPanel, {
+    size = 9,
+    color = COLORS.muted,
+    wrapped = true,
+})
+settingsPage.ClipsDescendants = true
+
+---------------------------------------------------------------------
+-- THEME SWITCHING
+---------------------------------------------------------------------
+
+local function applyTheme(name)
+    themeName = name
+    local theme = THEMES[name]
+    accent = theme.accent
+    accentSoft = theme.soft
+
+    tween(frameStroke, 0.25, {Color = accent})
+    tween(shadow, 0.25, {BackgroundColor3 = accent})
+    tween(header, 0.25, {BackgroundColor3 = accentSoft})
+    tween(headerBottom, 0.25, {BackgroundColor3 = accent})
+    tween(statusDot, 0.25, {BackgroundColor3 = accent})
+    mainPage.ScrollBarImageColor3 = accent
+    playerList.ScrollBarImageColor3 = accent
+
+    tween(lockTitle, 0.25, {TextColor3 = accent})
+    tween(playerCountLabel, 0.25, {TextColor3 = accent})
+    tween(toastStroke, 0.25, {Color = accent})
+    headerGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, theme.deep),
+        ColorSequenceKeypoint.new(0.55, accentSoft),
+        ColorSequenceKeypoint.new(1, theme.deep),
+    })
+    frameStrokeGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, COLORS.text),
+        ColorSequenceKeypoint.new(0.28, accent),
+        ColorSequenceKeypoint.new(0.72, accentSoft),
+        ColorSequenceKeypoint.new(1, COLORS.text),
+    })
+
+    for _, object in ipairs(frame:GetDescendants()) do
+        if object:IsA("UIStroke") then
+            object.Color = accent
+        end
+    end
+
+    for _, slider in ipairs(sliders) do
+        slider.fill.BackgroundColor3 = accent
+        slider.fillGradient.Color = ColorSequence.new(COLORS.text, accent)
+        slider.knobStroke.Color = accent
+    end
+
+    for button, meta in pairs(buttonMeta) do
+        if button.Parent then
+            -- Every "selected" button that uses the accent fill (part
+            -- buttons, lock, speed, flight, player rows, ESP toggles)
+            -- is re-tinted to the new accent.
+            if meta.active and meta.activeTextColor == COLORS.background then
+                meta.activeColor = accent
+            end
+            paintButton(button, false)
+        end
+    end
+
+    setButtonActive(purpleButton, name == "Purple")
+    setButtonActive(greenButton, name == "Green")
+    updatePartButtons()
+    refreshSpeedUI()
+    refreshFlightUI()
+    refreshEspUI()
+    refreshPlayerRows()
+end
+
+remember(purpleButton.Activated:Connect(function()
+    applyTheme("Purple")
+    showToast("PURPLE THEME APPLIED", accent)
+end))
+remember(greenButton.Activated:Connect(function()
+    applyTheme("Green")
+    showToast("GREEN THEME APPLIED", accent)
+end))
+remember(guiKeyButton.Activated:Connect(function()
+    beginListening("GUI", guiKeyButton, "PRESS A KEY  /  ESC TO CANCEL")
+end))
+remember(guiUnbindButton.Activated:Connect(function()
+    unbindAction("GUI")
+end))
+remember(guiToggleButton.Activated:Connect(function()
+    guiKeyEnabled = not guiKeyEnabled
+    guiToggleButton.Text = guiKeyEnabled and "GUI KEYBIND  /  ON" or "GUI KEYBIND  /  OFF"
+    setButtonActive(guiToggleButton, guiKeyEnabled)
+end))
+
+---------------------------------------------------------------------
+-- KEYBOARD INPUT
+---------------------------------------------------------------------
+
+remember(UIS.InputBegan:Connect(function(input, processed)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then
+        return
+    end
+
+    if listening then
+        if input.KeyCode == Enum.KeyCode.Unknown then
+            return
+        end
+
+        if input.KeyCode == Enum.KeyCode.Escape then
+            local cancelledButton = listeningButton
+            listening = nil
+            listeningButton = nil
+            refreshBindButtonNames()
+            if cancelledButton then
+                setButtonActive(cancelledButton, false)
+            end
+            setButtonActive(lockButton, locked, accent, COLORS.background)
+            setButtonActive(purpleButton, themeName == "Purple")
+            setButtonActive(greenButton, themeName == "Green")
+            setButtonActive(guiToggleButton, guiKeyEnabled)
+            return
+        end
+
+        if listening == "Lock" then
+            lockKey = input.KeyCode
+        elseif listening == "Random" then
+            randomKey = input.KeyCode
+        elseif listening == "Speed" then
+            speedKey = input.KeyCode
+        elseif listening == "Flight" then
+            flightKey = input.KeyCode
+        elseif listening == "GUI" then
+            guiKey = input.KeyCode
+        end
+
+        local completedButton = listeningButton
+        listening = nil
+        listeningButton = nil
+        refreshBindButtonNames()
+        setButtonActive(completedButton, false)
+        if locked then
+            setButtonActive(lockButton, true, accent, COLORS.background)
+        end
+        showToast("KEYBIND UPDATED", accent)
+        return
+    end
+
+    -- Don't fire hotkeys while typing in a text box (search, speed, flight).
+    if UIS:GetFocusedTextBox() then
+        return
+    end
+
+    if guiKeyEnabled and guiKey and input.KeyCode == guiKey then
+        if frame.Visible then
+            hideWindow()
+        else
+            showWindow()
+        end
+        return
+    end
+
+    if processed then
+        return
+    end
+
+    if lockKey and input.KeyCode == lockKey then
+        toggleLock()
+    elseif randomKey and input.KeyCode == randomKey then
+        partIndex = math.random(1, #parts)
+        updatePartButtons()
+        updateLockedPart()
+    elseif speedKey and input.KeyCode == speedKey then
+        toggleSpeed()
+    elseif flightKey and input.KeyCode == flightKey then
+        toggleFlight()
+    end
+end))
+
+---------------------------------------------------------------------
+-- CAMERA LOCK + SPEED
+---------------------------------------------------------------------
+
+RunService:BindToRenderStep(
+    "NeonLockCamera",
+    Enum.RenderPriority.Camera.Value + 1,
+    function(dt)
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+        if speedEnabled and not flightEnabled and root and humanoid
+            and humanoid.MoveDirection.Magnitude > 0 then
+            root.CFrame = root.CFrame + humanoid.MoveDirection * walkSpeed * dt
+        end
+
+        if not locked then
+            return
+        end
+
+        if not lockedPlayer or lockedPlayer.Parent ~= Players then
+            unlock()
+            return
+        end
+
+        character = lockedPlayer.Character
+        if not character then
+            lockedCharacter = nil
+            lockedPart = nil
+            setStatus("LOCKED  /  WAITING FOR RESPAWN", COLORS.warning)
+            return
+        end
+
+        if character ~= lockedCharacter then
+            lockedCharacter = character
+            lockedPart = nil
+            updateLockedPart()
+        end
+
+        if not lockedPart or not lockedPart.Parent then
+            updateLockedPart()
+            if not lockedPart then
+                return
+            end
+        end
+
+        local targetHumanoid = lockedCharacter:FindFirstChildOfClass("Humanoid")
+        if not targetHumanoid or targetHumanoid.Health <= 0 then
+            return
+        end
+
+        local camera = workspace.CurrentCamera
+        if not camera then
+            return
+        end
+
+        local targetPosition = lockedPart.Position
+            + lockedPart.AssemblyLinearVelocity * prediction
+        local desired = CFrame.lookAt(camera.CFrame.Position, targetPosition)
+
+        local alpha
+        if smoothness <= 0 then
+            alpha = 1
+        else
+            local response = 30 / (1 + smoothness * 0.65)
+            alpha = 1 - math.exp(-response * dt)
+        end
+
+        camera.CFrame = camera.CFrame:Lerp(desired, alpha)
+    end
+)
+
+---------------------------------------------------------------------
+-- FLIGHT MOVEMENT
+---------------------------------------------------------------------
+
+RunService:BindToRenderStep(
+    "NeonLockFlight",
+    Enum.RenderPriority.Character.Value + 1,
+    function(dt)
+        if not flightEnabled then
+            return
+        end
+
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local camera = workspace.CurrentCamera
+
+        if not root or not humanoid or not camera then
+            return
+        end
+
+        humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+        local move = Vector3.zero
+        local look = camera.CFrame.LookVector
+        local right = camera.CFrame.RightVector
+
+        -- IsKeyDown ignores text focus, so don't fly while typing.
+        if UIS:GetFocusedTextBox() == nil then
+            if UIS:IsKeyDown(Enum.KeyCode.W) then move += look end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then move -= look end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then move += right end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then move -= right end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then move += Vector3.yAxis end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then move -= Vector3.yAxis end
+        end
+
+        if move.Magnitude > 0 then
+            root.CFrame = root.CFrame + move.Unit * flightSpeed * dt
+        end
+
+        root.AssemblyLinearVelocity = Vector3.zero
+    end
+)
+
+---------------------------------------------------------------------
+-- RESPAWN / THEME INITIALIZATION / CLEANUP
+---------------------------------------------------------------------
+
+remember(player.CharacterAdded:Connect(function()
+    task.wait(0.2)
+    if flightEnabled then
+        flightEnabled = false
+        refreshFlightUI()
+    end
+end))
+
+syncShadowPosition()
+updatePartButtons()
+refreshBindButtonNames()
+refreshSpeedUI()
+refreshFlightUI()
+refreshEspUI()
+rebuildPlayerList()
+setButtonActive(purpleButton, true)
+setButtonActive(guiToggleButton, true)
+setButtonActive(listToggleButton, true)
+selectTab(true)
+
+local cleanupDone = false
+local function cleanup()
+    if cleanupDone then
+        return
+    end
+    cleanupDone = true
+
+    RunService:UnbindFromRenderStep("NeonLockCamera")
+    RunService:UnbindFromRenderStep("NeonLockFlight")
+    RunService:UnbindFromRenderStep("NeonLockESP")
+
+    for _, connection in ipairs(connections) do
+        if connection.Connected then
+            connection:Disconnect()
+        end
+    end
+
+    for index = #animations, 1, -1 do
+        local animation = animations[index]
+        pcall(function()
+            animation:Cancel()
+        end)
+    end
+
+    -- Remove ESP highlights (they live inside the other characters) and
+    -- the ESP overlay.
+    for other, obj in pairs(espObjects) do
+        pcall(function()
+            destroyEsp(obj)
+        end)
+        espObjects[other] = nil
+    end
+    if espGui.Parent then
+        espGui:Destroy()
+    end
+end
+
+remember(script.Destroying:Connect(cleanup))
+remember(gui.Destroying:Connect(cleanup))
